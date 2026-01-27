@@ -32,7 +32,7 @@ Download the latest version from the [Releases](https://github.com/WangChuDi/CSD
 Clone the project and download dependencies:
 
 ```bash
-git clone <repository_url>
+git clone https://github.com/WangChuDi/CSDA2DB.git
 cd CSDA2DB
 go mod tidy
 ```

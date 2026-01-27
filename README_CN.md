@@ -1,5 +1,7 @@
 # CSDA2DB
 
+[English](README.md)
+
 CSDA2DB 是一个将 Counter-Strike 2 Demo 分析数据自动导入 PostgreSQL 数据库的工具。它通过调用 [CSDA](https://github.com/akiver/cs-demo-analyzer) 工具生成 CSV 数据，并将其解析入库，支持自动表结构创建和列更新。
 
 ## 功能特性
@@ -30,7 +32,7 @@ CSDA2DB 是一个将 Counter-Strike 2 Demo 分析数据自动导入 PostgreSQL �
 克隆项目并下载依赖：
 
 ```bash
-git clone <repository_url>
+git clone https://github.com/WangChuDi/CSDA2DB.git
 cd CSDA2DB
 go mod tidy
 ```
