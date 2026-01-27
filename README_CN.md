@@ -37,7 +37,7 @@ go mod tidy
 
 ### 2. 数据库配置
 
-在项目根目录创建一个 `.env` 文件，填入你的数据库连接信息：
+在项目根目录创建一个 `.env` 文件（可以复制 `.env.example`），填入你的数据库连接信息：
 
 ```ini
 DB_HOST=localhost

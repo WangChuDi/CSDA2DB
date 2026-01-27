@@ -39,7 +39,7 @@ go mod tidy
 
 ### 2. Database Configuration
 
-Create a `.env` file in the project root directory and fill in your database connection information:
+Create a `.env` file in the project root directory (you can copy from `.env.example`) and fill in your database connection information:
 
 ```ini
 DB_HOST=localhost
