@@ -99,6 +99,7 @@ If a Demo has already been analyzed but needs to be updated/overwritten:
 | Argument | Description | Default |
 | :--- | :--- | :--- |
 | `-input` | **(Required)** Demo file path, folder path, or CSV file containing paths | - |
+| `-demo-id` | **(Required)** Demo identifier to tag every ingested row | - |
 | `-csda` | CSDA executable path | `./csda.exe` (or searched in system PATH) |
 | `-force` | Force re-analysis and overwrite old data in the database | `false` |
 

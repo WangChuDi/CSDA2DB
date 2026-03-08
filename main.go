@@ -23,11 +23,12 @@ var (
 	inputPath = flag.String("input", "", "Path to a CSV file containing demo paths, or a directory to search for .dem files")
 	force     = flag.Bool("force", false, "Force re-analysis of demos even if they exist in the database")
 	csdaPath  = flag.String("csda", "./csda.exe", "Path to the csda executable")
+	demoID    = flag.Int64("demo-id", -1, "Demo identifier to tag every ingested row (required)")
 
 	// Regex to match the filename pattern and extract the suffix as table name
-	// Example: match730_..._kills.csv -> kills
-	// It extracts everything after the 4th underscore as the table name.
-	filenameDataRegex = regexp.MustCompile(`^match\d+_\d+_\d+_\d+_(.+)\.csv$`)
+	// Example: heroic-vs-passion-ua-m1-overpass_kills.csv -> kills
+	// It extracts everything after the last underscore as the table name.
+	filenameDataRegex = regexp.MustCompile(`^.+_(.+)\.csv$`)
 )
 
 func main() {
@@ -35,6 +36,12 @@ func main() {
 
 	if *inputPath == "" {
 		os.Stderr.WriteString("Error: -input argument is required\n\n")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	if *demoID < 0 {
+		os.Stderr.WriteString("Error: -demo-id argument is required\n\n")
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -142,10 +149,19 @@ func ensureSystemTables() error {
 	query := `
 	CREATE TABLE IF NOT EXISTS processed_demos (
 		filename TEXT PRIMARY KEY,
+		demo_id BIGINT NOT NULL,
 		analyzed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 		filepath TEXT
 	);`
-	_, err := db.Exec(query)
+	if _, err := db.Exec(query); err != nil {
+		return err
+	}
+
+	alterQuery := `
+	ALTER TABLE processed_demos
+		ADD COLUMN IF NOT EXISTS demo_id BIGINT NOT NULL DEFAULT 0;
+	`
+	_, err := db.Exec(alterQuery)
 	return err
 }
 
@@ -225,7 +241,7 @@ func processDemo(demoPath, csdaExecPath string) error {
 	// Run CSDA
 	// Command structure: csda.exe -demo-path <demo_file> -output <output_dir>
 	log.Printf("Running CSDA: %s -demo-path %s -output %s", csdaExecPath, demoPath, tempDir)
-	cmd := exec.Command(csdaExecPath, "-demo-path", demoPath, "-output", tempDir)
+	cmd := exec.Command(csdaExecPath, "-demo-path", demoPath, "-output", tempDir, "-source", "valve")
 	// cmd.Dir = tempDir // No longer strictly needed if we pass absolute output path
 
 	// Capture output for debugging if needed
@@ -253,12 +269,13 @@ func processDemo(demoPath, csdaExecPath string) error {
 
 	// 2. Mark as processed
 	_, err = db.Exec(`
-		INSERT INTO processed_demos (filename, filepath, analyzed_at)
-		VALUES ($1, $2, $3)
+		INSERT INTO processed_demos (filename, filepath, analyzed_at, demo_id)
+		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (filename) DO UPDATE SET
 			analyzed_at = EXCLUDED.analyzed_at,
-			filepath = EXCLUDED.filepath;
-	`, filename, demoPath, time.Now())
+			filepath = EXCLUDED.filepath,
+			demo_id = EXCLUDED.demo_id;
+	`, filename, demoPath, time.Now(), *demoID)
 
 	if err != nil {
 		return fmt.Errorf("failed to update processed_demos status: %v", err)
@@ -339,17 +356,20 @@ func processCSVFile(filePath string) error {
 	}
 	defer txn.Rollback()
 
-	stmt, err := txn.Prepare(pq.CopyIn(tableName, headers...))
+	copyCols := append([]string{"demo_id"}, headers...)
+	stmt, err := txn.Prepare(pq.CopyIn(tableName, copyCols...))
 	if err != nil {
 		return fmt.Errorf("failed to prepare COPY statement: %v", err)
 	}
 	defer stmt.Close()
 
 	// Helper to insert a record
+	demoIDValue := *demoID
 	insertRecord := func(rec []string, line int) error {
-		args := make([]interface{}, len(rec))
+		args := make([]interface{}, len(rec)+1)
+		args[0] = demoIDValue
 		for i, v := range rec {
-			args[i] = v
+			args[i+1] = v
 		}
 		if _, err := stmt.Exec(args...); err != nil {
 			return fmt.Errorf("error executing COPY for row %d: %v", line, err)
@@ -404,7 +424,7 @@ func ensureSchema(tableName string, headers []string) error {
 }
 
 func createTable(tableName string, headers []string) error {
-	var cols []string
+	cols := []string{"\"demo_id\" BIGINT NOT NULL"}
 	for _, h := range headers {
 		cols = append(cols, fmt.Sprintf("\"%s\" TEXT", h))
 	}
@@ -428,6 +448,15 @@ func syncColumns(tableName string, headers []string) error {
 			return err
 		}
 		existingCols[colName] = true
+	}
+
+	if !existingCols["demo_id"] {
+		log.Printf("Adding missing column 'demo_id' to table '%s'", tableName)
+		query := fmt.Sprintf("ALTER TABLE \"%s\" ADD COLUMN IF NOT EXISTS \"demo_id\" BIGINT NOT NULL DEFAULT 0", tableName)
+		if _, err := db.Exec(query); err != nil {
+			return err
+		}
+		existingCols["demo_id"] = true
 	}
 
 	for _, h := range headers {
