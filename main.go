@@ -25,9 +25,8 @@ var (
 	csdaPath  = flag.String("csda", "./csda.exe", "Path to the csda executable")
 	demoID    = flag.Int64("demo-id", -1, "Demo identifier to tag every ingested row (required)")
 
-	// Regex to match the filename pattern and extract the suffix as table name
-	// Example: heroic-vs-passion-ua-m1-overpass_kills.csv -> kills
-	// It extracts everything after the last underscore as the table name.
+	// Regex to extract table name from CSV filename
+	// Example: fut-vs-astralis-m2-mirage_kills.csv -> kills
 	filenameDataRegex = regexp.MustCompile(`^.+_(.+)\.csv$`)
 )
 
@@ -215,8 +214,8 @@ func getDemoList(input string) ([]string, error) {
 
 func processDemo(demoPath, csdaExecPath string) error {
 	filename := filepath.Base(demoPath)
+	demoBaseName := strings.TrimSuffix(filename, filepath.Ext(filename))
 
-	// Check if processed
 	if !*force {
 		var exists bool
 		err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM processed_demos WHERE filename = $1)", filename).Scan(&exists)
@@ -231,26 +230,20 @@ func processDemo(demoPath, csdaExecPath string) error {
 
 	log.Printf("Analyzing demo: %s", filename)
 
-	// Create temp directory for output
 	tempDir, err := os.MkdirTemp("", "csda_output_*")
 	if err != nil {
 		return fmt.Errorf("failed to create temp dir: %v", err)
 	}
-	defer os.RemoveAll(tempDir) // Clean up
+	defer os.RemoveAll(tempDir)
 
-	// Run CSDA
-	// Command structure: csda.exe -demo-path <demo_file> -output <output_dir>
 	log.Printf("Running CSDA: %s -demo-path %s -output %s", csdaExecPath, demoPath, tempDir)
 	cmd := exec.Command(csdaExecPath, "-demo-path", demoPath, "-output", tempDir, "-source", "valve")
-	// cmd.Dir = tempDir // No longer strictly needed if we pass absolute output path
 
-	// Capture output for debugging if needed
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("csda executation failed: %v, output: %s", err, string(output))
 	}
 
-	// 1. Process generated CSVs
 	files, err := filepath.Glob(filepath.Join(tempDir, "*.csv"))
 	if err != nil {
 		return fmt.Errorf("failed to list generated CSVs: %v", err)
@@ -261,9 +254,9 @@ func processDemo(demoPath, csdaExecPath string) error {
 	}
 
 	for _, file := range files {
-		if err := processCSVFile(file); err != nil {
+		if err := processCSVFile(file, demoBaseName); err != nil {
 			log.Printf("Error processing CSV %s: %v", filepath.Base(file), err)
-			return err // Stop processing if one file fails? Or continue? Usually strict is better.
+			return err
 		}
 	}
 
@@ -285,14 +278,17 @@ func processDemo(demoPath, csdaExecPath string) error {
 	return nil
 }
 
-func processCSVFile(filePath string) error {
+func processCSVFile(filePath string, demoBaseName string) error {
 	fileName := filepath.Base(filePath)
 
-	matches := filenameDataRegex.FindStringSubmatch(fileName)
-	if len(matches) < 2 {
-		return fmt.Errorf("filename %s does not match expected pattern", fileName)
+	prefix := demoBaseName + "_"
+	if !strings.HasPrefix(fileName, prefix) {
+		return fmt.Errorf("filename %s does not start with expected prefix %s", fileName, prefix)
 	}
-	tableName := strings.ToLower(matches[1])
+
+	tableNameWithExt := strings.TrimPrefix(fileName, prefix)
+	tableName := strings.TrimSuffix(tableNameWithExt, ".csv")
+	tableName = strings.ToLower(tableName)
 
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -304,6 +300,10 @@ func processCSVFile(filePath string) error {
 	headers, err := reader.Read()
 	if err != nil {
 		return fmt.Errorf("failed to read header: %v", err)
+	}
+	// Normalize column names
+	for i, h := range headers {
+		headers[i] = normalizeColumnName(h)
 	}
 
 	if err := ensureSchema(tableName, headers); err != nil {
@@ -326,12 +326,12 @@ func processCSVFile(filePath string) error {
 		checksumIdx := -1
 		colName := ""
 		for i, h := range headers {
-			if strings.EqualFold(h, "match checksum") {
+			if h == "match_checksum" {
 				checksumIdx = i
 				colName = h
 				break
 			}
-			if strings.EqualFold(h, "checksum") {
+			if h == "checksum" {
 				checksumIdx = i
 				colName = h
 			}
@@ -476,4 +476,8 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func normalizeColumnName(name string) string {
+	return strings.ReplaceAll(name, " ", "_")
 }
