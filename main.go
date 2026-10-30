@@ -24,6 +24,7 @@ var (
 	force     = flag.Bool("force", false, "Force re-analysis of demos even if they exist in the database")
 	csdaPath  = flag.String("csda", "./csda.exe", "Path to the csda executable")
 	demoID    = flag.Int64("demo-id", -1, "Demo identifier to tag every ingested row (required)")
+	csvDir    = flag.String("csv-dir", "", "Import existing CSDA CSV exports for one demo without parsing it again")
 
 	// Regex to extract table name from CSV filename
 	// Example: fut-vs-astralis-m2-mirage_kills.csv -> kills
@@ -55,28 +56,44 @@ func main() {
 	}
 
 	// 3. Resolve CSDA path
-	resolvedCsdaPath, err := exec.LookPath(*csdaPath)
-	if err != nil {
-		log.Fatalf("CSDA executable not found (%s): %v", *csdaPath, err)
+	var resolvedCsdaPath string
+	var err error
+	if *csvDir == "" {
+		resolvedCsdaPath, err = exec.LookPath(*csdaPath)
+		if err != nil {
+			log.Fatalf("CSDA executable not found: %v", err)
+		}
+		resolvedCsdaPath, err = filepath.Abs(resolvedCsdaPath)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
-	resolvedCsdaPath, err = filepath.Abs(resolvedCsdaPath)
-	if err != nil {
-		log.Fatalf("Failed to resolve absolute path of CSDA executable: %v", err)
-	}
-	log.Printf("Using CSDA executable at: %s", resolvedCsdaPath)
 
 	// 4. Get list of demos
-	demos, err := getDemoList(*inputPath)
+	var demos []string
+	if *csvDir != "" && strings.EqualFold(filepath.Ext(*inputPath), ".dem") {
+		demos = []string{*inputPath} // CSV import does not require the original file.
+	} else {
+		demos, err = getDemoList(*inputPath)
+	}
 	if err != nil {
 		log.Fatalf("Failed to get demo list: %v", err)
 	}
 	log.Printf("Found %d demos to process", len(demos))
+	if len(demos) != 1 {
+		log.Fatal("one -demo-id must identify exactly one demo")
+	}
 
 	// 5. Process each demo
+	failed := false
 	for _, demoPath := range demos {
 		if err := processDemo(demoPath, resolvedCsdaPath); err != nil {
 			log.Printf("Error processing demo %s: %v", demoPath, err)
+			failed = true
 		}
+	}
+	if failed {
+		os.Exit(1)
 	}
 }
 
@@ -160,7 +177,20 @@ func ensureSystemTables() error {
 	ALTER TABLE processed_demos
 		ADD COLUMN IF NOT EXISTS demo_id BIGINT NOT NULL DEFAULT 0;
 	`
-	_, err := db.Exec(alterQuery)
+	if _, err := db.Exec(alterQuery); err != nil {
+		return err
+	}
+	// A basename can recur in different match directories. Keep each demo's
+	// processing record instead of overwriting another demo's filename entry.
+	_, err := db.Exec(`DO $$ DECLARE old_key text; BEGIN
+	 SELECT conname INTO old_key FROM pg_constraint
+	 WHERE conrelid='processed_demos'::regclass AND contype='p'
+	 AND pg_get_constraintdef(oid)='PRIMARY KEY (filename)';
+	 IF old_key IS NOT NULL THEN
+	  EXECUTE format('ALTER TABLE processed_demos DROP CONSTRAINT %I', old_key);
+	  ALTER TABLE processed_demos ADD PRIMARY KEY (demo_id, filename);
+	 END IF;
+	END $$;`)
 	return err
 }
 
@@ -218,7 +248,7 @@ func processDemo(demoPath, csdaExecPath string) error {
 
 	if !*force {
 		var exists bool
-		err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM processed_demos WHERE filename = $1)", filename).Scan(&exists)
+		err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM processed_demos WHERE demo_id = $1 AND filename = $2)", *demoID, filename).Scan(&exists)
 		if err != nil {
 			return err
 		}
@@ -230,18 +260,18 @@ func processDemo(demoPath, csdaExecPath string) error {
 
 	log.Printf("Analyzing demo: %s", filename)
 
-	tempDir, err := os.MkdirTemp("", "csda_output_*")
-	if err != nil {
-		return fmt.Errorf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	log.Printf("Running CSDA: %s -demo-path %s -output %s", csdaExecPath, demoPath, tempDir)
-	cmd := exec.Command(csdaExecPath, "-demo-path", demoPath, "-output", tempDir, "-source", "valve")
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("csda executation failed: %v, output: %s", err, string(output))
+	tempDir := *csvDir
+	if tempDir == "" {
+		var err error
+		tempDir, err = os.MkdirTemp("", "csda_output_*")
+		if err != nil {
+			return err
+		}
+		defer os.RemoveAll(tempDir)
+		cmd := exec.Command(csdaExecPath, "-demo-path", demoPath, "-output", tempDir, "-source", "valve")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("csda execution failed: %v, output: %s", err, string(output))
+		}
 	}
 
 	files, err := filepath.Glob(filepath.Join(tempDir, "*.csv"))
@@ -253,18 +283,32 @@ func processDemo(demoPath, csdaExecPath string) error {
 		return fmt.Errorf("no CSV files generated for demo %s", filename)
 	}
 
+	checksum, err := validateExportSet(files, demoBaseName)
+	if err != nil {
+		return err
+	}
+	txn, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer txn.Rollback()
+	// Serialize imports of the same demo; all replacement and the marker commit
+	// together. A failed CSV also rolls back earlier deletes, inserts and DDL.
+	if _, err := txn.Exec("SELECT pg_advisory_xact_lock($1)", *demoID); err != nil {
+		return err
+	}
 	for _, file := range files {
-		if err := processCSVFile(file, demoBaseName); err != nil {
+		if err := processCSVFile(txn, file, demoBaseName, checksum); err != nil {
 			log.Printf("Error processing CSV %s: %v", filepath.Base(file), err)
 			return err
 		}
 	}
 
 	// 2. Mark as processed
-	_, err = db.Exec(`
+	_, err = txn.Exec(`
 		INSERT INTO processed_demos (filename, filepath, analyzed_at, demo_id)
 		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (filename) DO UPDATE SET
+		ON CONFLICT (demo_id, filename) DO UPDATE SET
 			analyzed_at = EXCLUDED.analyzed_at,
 			filepath = EXCLUDED.filepath,
 			demo_id = EXCLUDED.demo_id;
@@ -273,12 +317,15 @@ func processDemo(demoPath, csdaExecPath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to update processed_demos status: %v", err)
 	}
+	if err := txn.Commit(); err != nil {
+		return err
+	}
 
 	log.Printf("Successfully analyzed and stored %s", filename)
 	return nil
 }
 
-func processCSVFile(filePath string, demoBaseName string) error {
+func processCSVFile(txn *sql.Tx, filePath string, demoBaseName string, checksum string) error {
 	fileName := filepath.Base(filePath)
 
 	prefix := demoBaseName + "_"
@@ -289,6 +336,9 @@ func processCSVFile(filePath string, demoBaseName string) error {
 	tableNameWithExt := strings.TrimPrefix(fileName, prefix)
 	tableName := strings.TrimSuffix(tableNameWithExt, ".csv")
 	tableName = strings.ToLower(tableName)
+	if !managedTables[tableName] {
+		return fmt.Errorf("unknown CSDA table %q", tableName)
+	}
 
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -305,12 +355,19 @@ func processCSVFile(filePath string, demoBaseName string) error {
 	for i, h := range headers {
 		headers[i] = normalizeColumnName(h)
 	}
+	if err := validateHeaders(headers); err != nil {
+		return err
+	}
 
-	if err := ensureSchema(tableName, headers); err != nil {
+	if err := ensureSchema(txn, tableName, headers); err != nil {
 		return fmt.Errorf("failed to ensure schema for table %s: %v", tableName, err)
 	}
 
-	// Read first record to get identifier for potential cleanup
+	// Delete by identity, including header-only exports, inside the demo transaction.
+	if _, err := txn.Exec("DELETE FROM "+pq.QuoteIdentifier(tableName)+" WHERE demo_id=$1", *demoID); err != nil {
+		return err
+	}
+	// Read first record, after clearing stale rows from empty tables too.
 	firstRecord, err := reader.Read()
 	if err != nil && err != io.EOF {
 		return fmt.Errorf("failed to read first record: %v", err)
@@ -319,42 +376,6 @@ func processCSVFile(filePath string, demoBaseName string) error {
 		log.Printf("File %s is empty, skipping", fileName)
 		return nil
 	}
-
-	// Handle cleanup if force is enabled
-	if *force {
-		// Try to find "match checksum" OR "checksum" column
-		checksumIdx := -1
-		colName := ""
-		for i, h := range headers {
-			if h == "match_checksum" {
-				checksumIdx = i
-				colName = h
-				break
-			}
-			if h == "checksum" {
-				checksumIdx = i
-				colName = h
-			}
-		}
-
-		if checksumIdx != -1 && len(firstRecord) > checksumIdx {
-			checksum := firstRecord[checksumIdx]
-			log.Printf("Force enabled: Cleaning up existing data for %s '%s' in table '%s'", colName, checksum, tableName)
-			// Use the actual column name found in the header to be safe, properly quoted
-			_, err := db.Exec(fmt.Sprintf("DELETE FROM \"%s\" WHERE \"%s\" = $1", tableName, colName), checksum)
-			if err != nil {
-				return fmt.Errorf("failed to delete existing data: %v", err)
-			}
-		} else {
-			log.Printf("Warning: Force enabled but 'match checksum' or 'checksum' column not found in %s. Appending data without cleanup.", fileName)
-		}
-	}
-
-	txn, err := db.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %v", err)
-	}
-	defer txn.Rollback()
 
 	copyCols := append([]string{"demo_id"}, headers...)
 	stmt, err := txn.Prepare(pq.CopyIn(tableName, copyCols...))
@@ -366,6 +387,11 @@ func processCSVFile(filePath string, demoBaseName string) error {
 	// Helper to insert a record
 	demoIDValue := *demoID
 	insertRecord := func(rec []string, line int) error {
+		for i, header := range headers {
+			if (header == "checksum" || header == "match_checksum") && rec[i] != checksum {
+				return fmt.Errorf("row %d belongs to another checksum", line)
+			}
+		}
 		args := make([]interface{}, len(rec)+1)
 		args[0] = demoIDValue
 		for i, v := range rec {
@@ -402,40 +428,35 @@ func processCSVFile(filePath string, demoBaseName string) error {
 		return fmt.Errorf("error flushing COPY: %v", err)
 	}
 
-	if err = txn.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %v", err)
-	}
-
 	return nil
 }
 
-func ensureSchema(tableName string, headers []string) error {
+func ensureSchema(txn *sql.Tx, tableName string, headers []string) error {
 	var exists bool
-	checkTableQuery := fmt.Sprintf("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'public' AND table_name = '%s')", tableName)
-	err := db.QueryRow(checkTableQuery).Scan(&exists)
+	err := txn.QueryRow("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = $1)", tableName).Scan(&exists)
 	if err != nil {
 		return err
 	}
 
 	if !exists {
-		return createTable(tableName, headers)
+		return createTable(txn, tableName, headers)
 	}
-	return syncColumns(tableName, headers)
+	return syncColumns(txn, tableName, headers)
 }
 
-func createTable(tableName string, headers []string) error {
+func createTable(txn *sql.Tx, tableName string, headers []string) error {
 	cols := []string{"\"demo_id\" BIGINT NOT NULL"}
 	for _, h := range headers {
-		cols = append(cols, fmt.Sprintf("\"%s\" TEXT", h))
+		cols = append(cols, pq.QuoteIdentifier(h)+" TEXT")
 	}
-	query := fmt.Sprintf("CREATE TABLE \"%s\" (%s)", tableName, strings.Join(cols, ", "))
+	query := fmt.Sprintf("CREATE TABLE IF NOT EXISTS \"%s\" (%s)", tableName, strings.Join(cols, ", "))
 	log.Printf("Creating table %s", tableName)
-	_, err := db.Exec(query)
+	_, err := txn.Exec(query)
 	return err
 }
 
-func syncColumns(tableName string, headers []string) error {
-	rows, err := db.Query("SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1", tableName)
+func syncColumns(txn *sql.Tx, tableName string, headers []string) error {
+	rows, err := txn.Query("SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1", tableName)
 	if err != nil {
 		return err
 	}
@@ -449,11 +470,15 @@ func syncColumns(tableName string, headers []string) error {
 		}
 		existingCols[colName] = true
 	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
 
 	if !existingCols["demo_id"] {
 		log.Printf("Adding missing column 'demo_id' to table '%s'", tableName)
 		query := fmt.Sprintf("ALTER TABLE \"%s\" ADD COLUMN IF NOT EXISTS \"demo_id\" BIGINT NOT NULL DEFAULT 0", tableName)
-		if _, err := db.Exec(query); err != nil {
+		if _, err := txn.Exec(query); err != nil {
 			return err
 		}
 		existingCols["demo_id"] = true
@@ -462,8 +487,8 @@ func syncColumns(tableName string, headers []string) error {
 	for _, h := range headers {
 		if !existingCols[h] {
 			log.Printf("Adding missing column '%s' to table '%s'", h, tableName)
-			query := fmt.Sprintf("ALTER TABLE \"%s\" ADD COLUMN \"%s\" TEXT", tableName, h)
-			if _, err := db.Exec(query); err != nil {
+			query := "ALTER TABLE " + pq.QuoteIdentifier(tableName) + " ADD COLUMN IF NOT EXISTS " + pq.QuoteIdentifier(h) + " TEXT"
+			if _, err := txn.Exec(query); err != nil {
 				return err
 			}
 		}

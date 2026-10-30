@@ -12,8 +12,9 @@ CSDA2DB 是一个将 Counter-Strike 2 Demo 分析数据自动导入 PostgreSQL �
     *   自动检测新列并执行 `ALTER TABLE` 添加字段。
 *   **增量与覆盖更新**:
     *   自动记录已分析过的 Demo，避免重复处理。
-    *   提供 `-force` 模式，可删除指定 Demo 的旧数据并重新导入（基于 `match checksum` 或 `checksum`）。
-*   **批量处理**: 支持递归扫描文件夹中的所有 Demo 文件。
+    *   `-force` 按 `demo_id` 替换结果，空表也会清理；全部表与处理标记在一个事务中提交，失败完整回滚。
+*   **复用分析结果**：`-csv-dir` 直接导入 fork 生成的完整 37 表 CSV，无需再解析 demo。
+*   每次调用只标记一个 demo；批处理需为每份文件分配独立 ID，目录或列表输入必须只解析到一份 demo。
 
 ## 下载
 
@@ -53,7 +54,7 @@ DB_NAME=csda2db
 ### 3. 编译
 
 ```bash
-go build -o csda2db.exe main.go
+go build -o csda2db.exe .
 ```
 
 ## 使用方法
@@ -63,19 +64,19 @@ go build -o csda2db.exe main.go
 处理单个 Demo 文件：
 
 ```powershell
-.\csda2db.exe -input "C:\Demos\match1.dem"
+.\csda2db.exe -demo-id 1 -input "C:\Demos\match1.dem"
 ```
 
 处理整个文件夹（递归扫描）：
 
 ```powershell
-.\csda2db.exe -input "C:\Demos\Tournament2024"
+.\csda2db.exe -demo-id 1 -input "C:\Demos\Tournament2024"
 ```
 
 使用 Demo 列表文件（CSV格式，每行一个路径）：
 
 ```powershell
-.\csda2db.exe -input "C:\lists\to_process.csv"
+.\csda2db.exe -demo-id 1 -input "C:\lists\to_process.csv"
 ```
 
 ### 进阶选项
@@ -84,23 +85,27 @@ go build -o csda2db.exe main.go
 如果 `csda.exe` 不在当前目录或系统 PATH 中：
 
 ```powershell
-.\csda2db.exe -input "..." -csda "C:\Tools\csda.exe"
+.\csda2db.exe -demo-id 1 -input "..." -csda "C:\Tools\csda.exe"
 ```
 
 **强制重新分析**
 如果某个 Demo 已经分析过但需要更新覆盖：
 
 ```powershell
-.\csda2db.exe -input "..." -force
+.\csda2db.exe -demo-id 1 -input "..." -force
 ```
 
 ## 命令行参数
 
+已有导出的用法：`csda2db -demo-id 1 -input match.dem -csv-dir output/1 -force`，此时原始 `.dem` 可以不在磁盘。缺表、CSV 格式错误或跨校验值的记录会拒绝导入。处理标记使用 `(demo_id, filename)`，同名文件不会覆盖其他 demo；错误退出码非零。
+
 | 参数 | 说明 | 默认值 |
 | :--- | :--- | :--- |
 | `-input` | **(必填)** Demo文件路径、文件夹路径或包含路径的CSV文件 | - |
+| `-demo-id` | **(必填)** 本次 demo 的数据库 ID | - |
 | `-csda` | CSDA 可执行文件路径 | `./csda.exe` (或系统PATH查找) |
 | `-force` | 强制重新分析并覆盖数据库中的旧数据 | `false` |
+| `-csv-dir` | 选中 demo 的完整已有 CSV 导出目录 | - |
 
 ## 常见问题
 
